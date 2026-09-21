@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Jev Runner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0b0f1a; --panel: #121829; --line: #1f2940; --text: #e6ebf5; --muted: #8b96b0;
+    --jev: #4ee6ff; --code: #8f9bb3; --fallback: #ffb347; --bad: #ff5c7a; --good: #5cff9d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  #wrap { display: flex; flex-wrap: wrap; gap: 12px; padding: 12px; align-items: flex-start; }
+  canvas { background: #0e1424; border: 1px solid var(--line); border-radius: 6px; display: block; outline: none; max-width: 100%; height: auto; }
+  #panel { width: 340px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+  #panel h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; }
+  .row { display: flex; justify-content: space-between; margin: 2px 0; }
+  .sec { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+  .bar { position: relative; height: 12px; background: #0b0f1a; border-radius: 3px; overflow: hidden; margin: 2px 0 4px; }
+  .bar > i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--jev); transition: width .15s; }
+  .bar > b { position: absolute; right: 4px; top: -1px; font-weight: normal; font-size: 11px; color: var(--text); }
+  .lbl { color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; }
+  .lbl.sel { color: var(--jev); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.on { background: var(--good); box-shadow: 0 0 6px var(--good); }
+  .dot.off { background: var(--bad); }
+  .dot.busy { background: var(--fallback); animation: pulse .5s infinite alternate; }
+  @keyframes pulse { from { opacity: .4 } to { opacity: 1 } }
+  #log { max-height: 150px; overflow: auto; font-size: 11px; color: var(--muted); }
+  #log div { white-space: nowrap; }
+  #log .j { color: var(--jev); } #log .f { color: var(--fallback); } #log .x { color: var(--bad); }
+  .help { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .big { font-size: 22px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540" tabindex="0"></canvas>
+  <aside id="panel">
+    <h2>Jev telemetry</h2>
+    <div class="row"><span><span id="dot" class="dot"></span><span id="status">connecting…</span></span><span id="model" style="color:var(--muted)"></span></div>
+    <div class="row"><span>last latency</span><span><b id="lat" class="big">–</b> ms</span></div>
+    <div class="row"><span>avg / min / max</span><span id="latstats">–</span></div>
+    <div class="row"><span>requests / fallbacks</span><span id="counts">0 / 0</span></div>
+
+    <div class="sec">
+      <div class="row"><span>difficulty (code-owned)</span><span id="diffv">–</span></div>
+      <div class="bar"><i id="diffbar" style="background:var(--good)"></i></div>
+    </div>
+
+    <div class="sec">
+      <div class="row"><span>skill <span style="color:var(--muted)">(score, expected)</span></span><span id="skillv">–</span></div>
+      <div id="skillbars"></div>
+    </div>
+
+    <div class="sec">
+      <div class="row"><span>next platform <span style="color:var(--muted)">(choice)</span></span><span id="choicev">–</span></div>
+      <div id="choicebars"></div>
+    </div>
+
+    <div class="sec">
+      <div class="lbl"><span>frustrated (noul)</span><span id="frv">–</span></div>
+      <div class="bar"><i id="frbar" style="background:var(--bad)"></i></div>
+      <div class="lbl"><span>cruising (noul)</span><span id="crv">–</span></div>
+      <div class="bar"><i id="crbar" style="background:var(--good)"></i></div>
+    </div>
+
+    <div class="sec">
+      <div class="row"><span>decision log</span></div>
+      <div id="log"></div>
+    </div>
+    <div class="help">← → / A D: move · Space / ↑ / W: jump (hold = higher) · R: restart · H: ゾーン表示 on/off<br>
+      <b>足場の上帯 = ジャンプ位置</b>（キャラ足元の黄マーカー基準）: <span style="color:#5cff9d">■ 良い</span> <span style="color:#ffd166">■ 早い</span> <span style="color:#ff5c7a">■ 早すぎ</span><br>
+      <b>足場の本体 = 着地位置</b>: <span style="color:#ff5c7a">■ ギリギリ↓</span> <span style="color:#ffd166">■ 前寄り</span> <span style="color:#5cff9d">■ 中央↑</span> <span style="color:#4ee6ff">■ 奥↑</span><br>
+      足場の色: <span style="color:var(--jev)">■ Jev</span> <span style="color:var(--code)">■ code</span> <span style="color:var(--fallback)">■ fallback (Jev が間に合わなかった)</span></div>
+  </aside>
+</div>
+
+<script>
+'use strict';
+// ============================================================================
+// Constants — physics is code-owned so that every platform Jev "chooses" is
+// guaranteed reachable. Jev picks the *kind*; code turns it into geometry.
+// ============================================================================
+const W = 960, H = 540;
+const G = 2000;            // px/s^2
+const JUMP_V = 750;        // px/s
+const JUMP_CUT_V = 380;    // releasing early clamps upward speed to this (min jump ~36px, full jump = hold >=185ms)
+const RUN_V = 260;         // px/s
+const ACCEL = 2600, FRICTION = 2200;
+const COYOTE = 0.09, JUMP_BUFFER = 0.12;
+const PW = 28, PH = 40;
+const PLAT_H = 18;
+const LOOKAHEAD = 2;       // platforms kept ahead of the player
+const MAX_ATTEMPTS_IN_STATE = 8;
+
+const KIND_LABEL = {
+  breather: 'BREATHER', standard: 'STD', long_jump: 'LONG', high_step: 'HIGH',
+  drop: 'DROP', narrow: 'NARROW', moving: 'MOVING',
+};
+const SKILL_LEGEND = ['struggling', 'barely', 'inconsistent', 'reliable', 'expert'];
+
+// Horizontal distance the player covers when jumping at the edge and landing
+// on a platform whose top is `dyUp` px higher (negative = lower). Landing only
+// counts while falling, so we take the descending root.
+function reach(dyUp) {
+  const disc = JUMP_V * JUMP_V - 2 * G * dyUp;
+  if (disc < 0) return 0;
+  return RUN_V * ((JUMP_V + Math.sqrt(disc)) / G);
+}
+const MAX_UP = (JUMP_V * JUMP_V) / (2 * G) - 10; // ~130px
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// ============================================================================
+// Game state
+// ============================================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.focus();
+
+let keys = {};
+let game;            // reset() fills this
+let jev = {          // telemetry
+  online: null, model: '', busy: false, count: 0, fallbacks: 0,
+  lats: [], last: null, lastAnswers: null,
+};
+
+function reset() {
+  game = {
+    t: 0,
+    player: { x: 60, y: 300 - PH, vx: 0, vy: 0, onGround: false, groundIdx: -1, coyote: 0, jumpBuf: 0, jumping: false, facing: 1 },
+    platforms: [],
+    camX: 0,
+    wallX: -500,
+    lives: 3, cleared: 0, streak: 0,
+    difficulty: 0.3,
+    attempts: [],       // history for Jev state
+    falls: 0,
+    // per-platform bookkeeping for building an attempt
+    stand: null,        // { idx, since, reversals, lastDir }
+    jump: null,         // { fromIdx, edgeOffset, hesitation, reversals }
+    over: false,
+    started: false,     // title screen until Enter
+    inflight: null,     // { idx, replace }
+    flash: 0, msg: '', msgT: 0,
+  };
+  // Opening platforms are code-made; Jev takes over from the first landing.
+  game.platforms.push(mkPlatform(null, 'breather', 0, 'code'));
+  game.platforms[0].x = 0; game.platforms[0].w = 260; game.platforms[0].y = 300;
+  for (let i = 0; i < LOOKAHEAD; i++) game.platforms.push(mkPlatform(game.platforms.at(-1), 'standard', 0.2, 'code'));
+  game.player.x = 60; game.player.y = 300 - PH;
+  jev.busy = false;
+  updateDiffUI();
+}
+
+// ---------------------------------------------------------------------------
+// Geometry: (kind, difficulty) -> platform, always reachable from `prev`.
+// ---------------------------------------------------------------------------
+function mkPlatform(prev, kind, d, source) {
+  const p = { kind, source, idx: prev ? prev.idx + 1 : 0, h: PLAT_H, visited: false, moving: null, born: performance.now() };
+  if (!prev) { Object.assign(p, { x: 0, y: 300, w: 260 }); return p; }
+  d = clamp(d, 0, 1);
+  // d = 1 is meant to be brutal: gaps near the physical limit, landing surfaces
+  // barely wider than the player, fast movers. d = 0 is a warm-up.
+  let gap, dy = 0, w; // dy: positive = higher than prev
+  const mover = (amp, period) => ({ amp, period, phase: Math.random() * Math.PI * 2 });
+  switch (kind) {
+    case 'breather': gap = lerp(40, 70, d); w = 200; dy = rnd(-15, 15); break;
+    case 'long_jump': dy = 0; gap = reach(0) * lerp(0.7, 0.9, d); w = lerp(160, 80, d); break;
+    case 'high_step': dy = lerp(50, 118, d); gap = reach(dy) * lerp(0.5, 0.78, d); w = lerp(160, 80, d); break;
+    case 'drop': dy = -lerp(60, 160, d); gap = reach(dy) * lerp(0.6, 0.9, d); w = lerp(160, 80, d); break;
+    case 'narrow': dy = rnd(-20, 20); gap = lerp(70, 150, d); w = lerp(72, 36, d); break;
+    case 'moving': dy = rnd(-20, 20); gap = lerp(80, 150, d); w = lerp(140, 80, d);
+      p.moving = mover(lerp(25, 60, d), lerp(3.2, 2.0, d)); break;
+    default: /* standard */ dy = rnd(-40, 40) * d; gap = lerp(70, 165, d); w = lerp(180, 70, d);
+  }
+  // Above d≈0.6, hazards start to combine (probability grows with d). Code owns
+  // this; Jev only picked the base kind. Recorded as `modifier` in the state.
+  if (d > 0.6 && Math.random() < (d - 0.6) * 1.6) {
+    if (kind === 'narrow' && !p.moving) { p.moving = mover(lerp(15, 30, d), 3.0); p.modifier = 'also_moving'; }
+    else if (kind === 'high_step' || kind === 'long_jump' || kind === 'drop') { w = Math.min(w, lerp(70, 48, d)); p.modifier = 'also_narrow'; }
+    else if (kind === 'standard') { p.moving = mover(lerp(20, 40, d), 2.6); p.modifier = 'also_moving'; }
+  }
+  // Keep inside the playfield: if this kind would leave it, go the other way
+  // gently and stop pretending it is still a drop / high step.
+  let y = prev.y - dy;
+  if (y < 110 || y > 460) {
+    dy = -Math.sign(dy || 1) * Math.min(Math.abs(dy), 60);
+    y = prev.y - dy;
+    gap = Math.min(gap, reach(dy) * 0.8);
+    if (kind === 'drop' || kind === 'high_step') p.kind = 'standard';
+  }
+  if (dy > MAX_UP) { dy = MAX_UP; y = prev.y - dy; }
+  // Reachability guard. Moving platforms (this one or the previous) swing by
+  // `amp`, so the worst-case gap is wider than the resting one.
+  const slack = (p.moving?.amp ?? 0) + (prev.moving?.amp ?? 0);
+  const maxGap = reach(dy) * lerp(0.86, 0.93, d) - 4 - slack;
+  gap = Math.max(30, Math.min(gap, maxGap));
+  p.x = prev.x + prev.w + gap; p.y = y; p.w = Math.round(w);
+  if (p.moving) p.moving.x0 = p.x;
+  p.gap = Math.round(gap); p.dy = Math.round(dy);
+  return p;
+}
+
+function platX(p) {
+  if (!p.moving) return p.x;
+  return p.moving.x0 + Math.sin(game.t * 2 * Math.PI / p.moving.period + p.moving.phase) * p.moving.amp;
+}
+
+// ============================================================================
+// Attempt bookkeeping -> state for Jev. Code turns raw numbers into plain
+// labels so the model reasons about situations, not thresholds.
+// ============================================================================
+function diffLabel(d) { return d < 0.25 ? 'easy' : d < 0.5 ? 'moderate' : d < 0.75 ? 'hard' : 'very_hard'; }
+// Thresholds shared by the state labels and the on-screen zones. Jump offset is
+// measured from the player's RIGHT edge to the platform edge; landing is the
+// player's CENTER as a fraction of the platform width.
+const JUMP_ZONES = { edge: 10, good: 45, early: 95 };
+const LAND_ZONES = { barely: 0.15, front: 0.4, center: 0.7 };
+function timingLabel(off) { return off < JUMP_ZONES.edge ? 'at_the_very_edge' : off < JUMP_ZONES.good ? 'well_timed' : off < JUMP_ZONES.early ? 'early' : 'very_early'; }
+function landingLabel(r) { return r < LAND_ZONES.barely ? 'barely_made_it' : r < LAND_ZONES.front ? 'front_half' : r < LAND_ZONES.center ? 'center' : 'deep'; }
+function hesitationLabel(ms) { return ms > 800 ? 'long_pause' : ms > 300 ? 'brief_pause' : 'none'; }
+
+function challengeOf(p) {
+  return { kind: p.kind, modifier: p.modifier ?? 'none', gap_px: p.gap, height_change_px: p.dy, landing_width_px: p.w, difficulty: diffLabel(game.difficulty), moving: !!p.moving };
+}
+
+function recordAttempt(a) {
+  game.attempts.push(a);
+  if (game.attempts.length > 30) game.attempts.shift();
+}
+
+function buildState() {
+  const recent = game.attempts.slice(-MAX_ATTEMPTS_IN_STATE);
+  const fallsRecent = recent.filter(a => a.outcome !== 'landed').length;
+  return {
+    game: {
+      description: 'Side-scrolling platformer. The player runs right and jumps across gaps between floating platforms. Falling into a gap or being caught by the wall advancing from the left costs a life. Jump height depends on how long the jump key is held.',
+    },
+    player: {
+      lives_left: game.lives,
+      platforms_cleared: game.cleared,
+      current_streak_without_falling: game.streak,
+      falls_in_recent_attempts: fallsRecent,
+      falls_total: game.falls,
+    },
+    current_difficulty: diffLabel(game.difficulty),
+    recent_attempts: recent,
+    latest_attempt: recent.at(-1) ?? null,
+  };
+}
+
+// ============================================================================
+// Jev pipeline: one request in flight at a time, LOOKAHEAD platforms ahead.
+// If a platform is needed before Jev answers, code makes a fallback one and
+// the late answer is only used to update difficulty.
+// ============================================================================
+function ensureLookahead() {
+  if (game.over || game.inflight) return;
+  const pl = game.player;
+  const need = (pl.groundIdx >= 0 ? pl.groundIdx : game.jump?.fromIdx ?? 0) + LOOKAHEAD;
+  if (game.platforms.length - 1 < need) requestPlatform(game.platforms.length, false);
+}
+
+async function requestPlatform(idx, replace) {
+  if (game.inflight) return;
+  const state = buildState();
+  game.inflight = { idx, replace, t0: performance.now() };
+  jev.busy = true; updateStatusUI();
+  let answers = null, latency = null, serverMs = null, model = null, err = null;
+  try {
+    const res = await fetch('/api/next', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state }) });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+    answers = j.answers; latency = Math.round(performance.now() - game.inflight.t0); serverMs = j.latency_ms; model = j.model;
+  } catch (e) { err = e; }
+  if (game.inflight?.idx !== idx) return; // reset() happened meanwhile
+  game.inflight = null; jev.busy = false;
+
+  let kind, via;
+  if (answers) {
+    try {
+      kind = applyJudgment(answers); via = 'jev';
+      jev.online = true; jev.model = model; jev.count++; jev.lats.push(latency); if (jev.lats.length > 50) jev.lats.shift();
+      jev.last = { latency, serverMs }; jev.lastAnswers = answers;
+    } catch (e) { answers = null; err = new Error('unexpected answer shape: ' + e.message); }
+  }
+  if (!answers) {
+    jev.online = false; jev.lastError = err?.message || 'error';
+    kind = applyHeuristic(); via = 'heuristic';
+    log(`<span class="x">Jev unavailable: ${escapeHtml(jev.lastError)} → heuristic</span>`);
+  }
+
+  const prev = game.platforms[idx - 1];
+  const existing = game.platforms[idx];
+  if (!existing) {
+    game.platforms[idx] = mkPlatform(prev, kind, game.difficulty, via === 'jev' ? 'jev' : 'code');
+    log(`#${idx} <span class="${via === 'jev' ? 'j' : 'f'}">${KIND_LABEL[kind]}</span> ${fmtAnswers(answers)} ${latency != null ? latency + 'ms' : ''}`);
+  } else if (replace && idx === game.platforms.length - 1 && existing.x > game.camX + W + 20 && !existing.visited) {
+    game.platforms[idx] = mkPlatform(prev, kind, game.difficulty, via === 'jev' ? 'jev' : 'code');
+    log(`#${idx} <span class="${via === 'jev' ? 'j' : 'f'}">${KIND_LABEL[kind]}</span> (replaced after fall) ${latency != null ? latency + 'ms' : ''}`);
+  } else if (replace) {
+    log(`#${idx} kept (already on screen) — difficulty only ${latency != null ? latency + 'ms' : ''}`);
+  } else {
+    log(`#${idx} <span class="f">late by ${Math.round(performance.now() - existing.born)}ms</span> — difficulty only ${latency != null ? latency + 'ms' : ''}`);
+  }
+  updateTelemetryUI();
+  ensureLookahead();
+}
+
+// Composition is policy, and policy lives in code.
+function applyJudgment(a) {
+  const skill = a.skill.score;                 // 0..4 expected value
+  // Jev spreads probability between the top two levels rather than saturating,
+  // so a strong player reads as ~3.2, not 4. Map so that 3.5 already means max.
+  const target = clamp((skill - 0.5) / 3, 0, 1);
+  let d = lerp(game.difficulty, target, 0.4);  // EMA so one lucky jump doesn't spike it
+  const fr = a.frustrated.noul, cr = a.cruising.noul;
+  if (fr > 0.6) d -= 0.15;
+  if (cr > 0.5) d += 0.1;
+  // Code-owned pressure: a long streak keeps tightening even if the score
+  // plateaus — but only while Jev still reads the landings as clean. Gated by
+  // skill (0 at ≤2.5, full at ≥3.5) so sloppy-but-surviving play is pulled
+  // back down by the EMA instead of being pinned at max.
+  if (game.streak >= 6) d += 0.01 * Math.min(10, game.streak - 5) * clamp(skill - 2.5, 0, 1);
+  game.difficulty = clamp(d, 0, 1);
+  let kind = a.next_platform.choice;
+  if (fr > 0.75) kind = 'breather';            // hard rule, regardless of the choice
+  return kind;
+}
+
+// Offline fallback so the game still plays without a key / network.
+function applyHeuristic() {
+  const recent = game.attempts.slice(-6);
+  if (!recent.length) return 'standard';
+  let s = 0;
+  for (const a of recent) {
+    if (a.outcome !== 'landed') { s += 0; continue; }
+    s += 2 + (a.landed_at_fraction_of_platform > 0.35 ? 1 : 0) + (a.hesitation === 'none' ? 0.6 : 0) + (a.jump_timing === 'well_timed' || a.jump_timing === 'at_the_very_edge' ? 0.4 : 0);
+  }
+  const skill = s / recent.length; // 0..4
+  game.difficulty = clamp(lerp(game.difficulty, clamp((skill - 0.5) / 3, 0, 1), 0.4), 0, 1);
+  if (recent.at(-1).outcome !== 'landed') return 'breather';
+  const pool = skill < 1.5 ? ['standard', 'breather'] : skill < 2.8 ? ['standard', 'long_jump', 'high_step'] : ['long_jump', 'high_step', 'drop', 'narrow', 'moving'];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ============================================================================
+// Simulation
+// ============================================================================
+function onLand(idx, landX) {
+  const pl = game.player, p = game.platforms[idx];
+  const wasJump = game.jump;
+  if (wasJump && idx > wasJump.fromIdx) {
+    const ratio = clamp((landX + PW / 2 - platX(p)) / p.w, 0, 1);
+    recordAttempt({
+      challenge: challengeOf(p),
+      outcome: 'landed',
+      jump_timing: timingLabel(wasJump.edgeOffset),
+      jumped_px_before_edge: Math.round(wasJump.edgeOffset),
+      landing_spot: landingLabel(ratio),
+      landed_at_fraction_of_platform: +ratio.toFixed(2),
+      hesitation: hesitationLabel(wasJump.hesitation),
+      hesitation_ms: Math.round(wasJump.hesitation),
+      direction_reversals_before_jump: wasJump.reversals,
+    });
+    game.cleared += idx - wasJump.fromIdx; game.streak += 1;
+    if (!p.visited) { p.visited = true; }
+    game.jump = null;
+    ensureLookahead();
+  } else {
+    // Landed on the same platform (or one behind): not an attempt.
+    game.jump = null;
+    if (idx > (game.stand?.idx ?? -1)) p.visited = true;
+  }
+  if (!game.stand || game.stand.idx !== idx) game.stand = { idx, since: game.t, reversals: 0, lastDir: 0 };
+}
+
+function onLeaveGround(byJump) {
+  const st = game.stand; if (!st) return;
+  const p = game.platforms[st.idx];
+  const edgeOffset = (platX(p) + p.w) - (game.player.x + PW);
+  const traverse = p.w / RUN_V * 1000;
+  const hesitation = Math.max(0, (game.t - st.since) * 1000 - traverse);
+  game.jump = { fromIdx: st.idx, edgeOffset: Math.max(0, edgeOffset), hesitation, reversals: st.reversals, byJump };
+}
+
+function fail(reason) {
+  const pl = game.player;
+  const fromIdx = game.jump?.fromIdx ?? game.stand?.idx ?? 0;
+  const target = game.platforms[fromIdx + 1];
+  recordAttempt({
+    challenge: target ? challengeOf(target) : null,
+    outcome: reason, // 'fell' | 'caught_by_wall'
+    jump_timing: game.jump ? timingLabel(game.jump.edgeOffset) : 'did_not_jump',
+    jumped_px_before_edge: game.jump ? Math.round(game.jump.edgeOffset) : null,
+    hesitation: game.jump ? hesitationLabel(game.jump.hesitation) : 'long_pause',
+    hesitation_ms: game.jump ? Math.round(game.jump.hesitation) : null,
+    direction_reversals_before_jump: game.jump?.reversals ?? game.stand?.reversals ?? 0,
+  });
+  game.falls++; game.streak = 0; game.lives--; game.flash = 1;
+  // Immediate code-owned relief: don't wait for Jev's next verdict to ease off.
+  // Jev's answer then re-anchors from here (its target will be lower too, since
+  // the fall is now in `recent_attempts`).
+  game.difficulty = clamp(game.difficulty - 0.15, 0, 1);
+  updateDiffUI();
+  log(`<span class="x">${reason} → difficulty −0.15 (now ${game.difficulty.toFixed(2)})</span>`);
+  game.jump = null;
+  if (game.lives <= 0) { game.over = true; msg('GAME OVER — R to restart'); return; }
+  // respawn on the platform we came from
+  const p = game.platforms[fromIdx];
+  pl.x = platX(p) + Math.min(40, p.w / 2 - PW / 2); pl.y = p.y - PH; pl.vx = 0; pl.vy = 0;
+  pl.onGround = true; pl.groundIdx = fromIdx; pl.jumping = false; pl.coyote = COYOTE;
+  game.stand = { idx: fromIdx, since: game.t, reversals: 0, lastDir: 0 };
+  game.wallX = Math.min(game.wallX, pl.x - 520);
+  msg(reason === 'fell' ? 'FELL' : 'CAUGHT');
+  // Ask Jev to reconsider the farthest unseen platform right away.
+  const farIdx = fromIdx + LOOKAHEAD;
+  if (game.platforms[farIdx] && farIdx === game.platforms.length - 1 && !game.inflight) requestPlatform(farIdx, true);
+  else ensureLookahead();
+}
+
+function msg(s) { game.msg = s; game.msgT = 1.2; }
+
+function update(dt) {
+  if (game.over || !game.started) return;
+  game.t += dt;
+  const pl = game.player;
+  const left = keys.ArrowLeft || keys.KeyA, right = keys.ArrowRight || keys.KeyD;
+  const jumpKey = keys.Space || keys.ArrowUp || keys.KeyW || keys.KeyZ;
+
+  // horizontal
+  const dir = (right ? 1 : 0) - (left ? 1 : 0);
+  if (dir) { pl.vx += dir * ACCEL * dt; pl.facing = dir; }
+  else { const s = Math.sign(pl.vx); pl.vx -= s * Math.min(Math.abs(pl.vx), FRICTION * dt); }
+  pl.vx = clamp(pl.vx, -RUN_V, RUN_V);
+  if (game.stand && pl.onGround && dir && game.stand.lastDir && dir !== game.stand.lastDir) game.stand.reversals++;
+  if (dir && game.stand) game.stand.lastDir = dir;
+
+  // carry on moving platform
+  let carry = 0;
+  if (pl.onGround && pl.groundIdx >= 0) {
+    const p = game.platforms[pl.groundIdx];
+    if (p?.moving) { const nx = platX(p); carry = nx - (p._lastX ?? nx); p._lastX = nx; }
+  }
+  for (const p of game.platforms) if (p.moving) p._lastX = platX(p);
+
+  // jump
+  pl.jumpBuf = jumpKey && !pl.jumpHeld ? JUMP_BUFFER : Math.max(0, pl.jumpBuf - dt);
+  pl.jumpHeld = !!jumpKey;
+  if (pl.onGround) pl.coyote = COYOTE; else pl.coyote = Math.max(0, pl.coyote - dt);
+  if (pl.jumpBuf > 0 && pl.coyote > 0) {
+    pl.jumpBuf = 0; pl.coyote = 0;
+    if (pl.onGround || game.stand) onLeaveGround(true);
+    pl.vy = -JUMP_V; pl.onGround = false; pl.groundIdx = -1; pl.jumping = true;
+  }
+  if (pl.jumping && !jumpKey && pl.vy < -JUMP_CUT_V) pl.vy = -JUMP_CUT_V;
+
+  // integrate
+  const wasOnGround = pl.onGround;
+  const prevBottom = pl.y + PH;
+  pl.vy += G * dt;
+  pl.x += pl.vx * dt + carry;
+  pl.y += pl.vy * dt;
+  pl.onGround = false;
+
+  // landing: only when falling and feet cross the top surface
+  if (pl.vy >= 0) {
+    for (const p of game.platforms) {
+      const px = platX(p);
+      if (pl.x + PW > px + 2 && pl.x < px + p.w - 2) {
+        const bottom = pl.y + PH;
+        if (prevBottom <= p.y + 1 && bottom >= p.y) {
+          pl.y = p.y - PH; pl.vy = 0; pl.onGround = true; pl.jumping = false;
+          if (pl.groundIdx !== p.idx) { pl.groundIdx = p.idx; onLand(p.idx, pl.x); }
+          break;
+        }
+      }
+    }
+  }
+  if (wasOnGround && !pl.onGround && !pl.jumping) onLeaveGround(false); // walked off
+  if (pl.onGround && game.stand && game.stand.idx !== pl.groundIdx) game.stand = { idx: pl.groundIdx, since: game.t, reversals: 0, lastDir: 0 };
+
+  // wall
+  const wallV = 90 + 165 * game.difficulty; // tops out just below RUN_V: at d=1 any pause is fatal
+  game.wallX += wallV * dt;
+  game.wallX = Math.max(game.wallX, pl.x - 720);
+
+  // fallback: about to run out of platforms (~0.25s from the edge and Jev is not back yet)
+  const last = game.platforms.at(-1);
+  if (pl.x + PW > platX(last) + last.w - 70 && pl.groundIdx === last.idx) {
+    const fb = mkPlatform(last, 'standard', game.difficulty, 'fallback');
+    game.platforms.push(fb); jev.fallbacks++;
+    log(`#${fb.idx} <span class="f">FALLBACK</span> (Jev not back yet)`);
+    updateTelemetryUI();
+  }
+
+  // failure
+  if (pl.y > 480) fail('fell'); // feet reach the ground line drawn in the background
+  else if (game.wallX > pl.x + PW * 0.6) fail('caught_by_wall');
+
+  // camera
+  const targetCam = pl.x - 260;
+  game.camX += (targetCam - game.camX) * Math.min(1, dt * 8);
+  game.camX = Math.max(game.camX, targetCam - 40);
+
+  // prune far-behind platforms (keep indices stable by leaving holes out of the array? no — keep them, cheap)
+  if (game.flash > 0) game.flash -= dt * 2;
+  if (game.msgT > 0) game.msgT -= dt;
+}
+
+// ============================================================================
+// Rendering
+// ============================================================================
+const COLORS = { jev: '#4ee6ff', code: '#8f9bb3', fallback: '#ffb347' };
+
+// ---------------------------------------------------------------------------
+// Background: bright sky, rounded green hills, bushes and puffy clouds in
+// three parallax layers (original art, 16-bit platformer vibe). Everything is
+// placed deterministically from an index so it is stable while scrolling.
+// ---------------------------------------------------------------------------
+const hash = (i, k = 0) => { let h = (i * 374761393 + k * 668265263) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+function roundHill(x, base, w, h, fill, line) {
+  ctx.beginPath(); ctx.moveTo(x, base);
+  ctx.lineTo(x, base - h + w / 2); ctx.arc(x + w / 2, base - h + w / 2, w / 2, Math.PI, 0); ctx.lineTo(x + w, base); ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = line; ctx.lineWidth = 3; ctx.stroke();
+}
+function cloud(x, y, s) {
+  ctx.fillStyle = '#ffffff';
+  for (const [dx, dy, r] of [[0, 0, 16], [18, -8, 20], [40, 0, 16], [20, 6, 18]]) { ctx.beginPath(); ctx.arc(x + dx * s, y + dy * s, r * s, 0, Math.PI * 2); ctx.fill(); }
+  ctx.fillStyle = '#d6ecff'; ctx.fillRect(x - 16 * s, y + 8 * s, 72 * s, 6 * s);
+}
+function drawTitle() {
+  ctx.fillStyle = 'rgba(10,14,30,0.6)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+  ctx.font = 'bold 56px monospace'; ctx.lineWidth = 8; ctx.strokeStyle = '#0b0f1a'; ctx.strokeText('JEV RUNNER', W / 2, 200); ctx.fillStyle = '#4ee6ff'; ctx.fillText('JEV RUNNER', W / 2, 200);
+  ctx.font = '15px monospace'; ctx.fillStyle = '#e6ebf5';
+  ctx.fillText('着地するたびに Jev が腕前を読んで次の足場を決める。上手いほど鬼、下手なら優しく。', W / 2, 245);
+  ctx.fillText('← → 移動 · Space ジャンプ（長押しで高く）· H ゾーン表示 · R リスタート', W / 2, 275);
+  const blink = Math.floor(performance.now() / 500) % 2 === 0;
+  if (blink) { ctx.font = 'bold 24px monospace'; ctx.fillStyle = '#ffd166'; ctx.fillText('PRESS ENTER', W / 2, 340); }
+}
+function drawBackground() {
+  const sky = ctx.createLinearGradient(0, 0, 0, H); sky.addColorStop(0, '#5c94fc'); sky.addColorStop(0.7, '#8fc4ff'); sky.addColorStop(1, '#bfe3ff');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+  // clouds (slowest layer)
+  const cx = game.camX * 0.12, cs = 420;
+  for (let i = Math.floor(cx / cs) - 1; i <= Math.floor((cx + W) / cs) + 1; i++) cloud(i * cs + hash(i, 1) * 200 - cx, 60 + hash(i, 2) * 150, 0.7 + hash(i, 3) * 0.6);
+  // far hills
+  const fx = game.camX * 0.25, fs = 360, base = 470;
+  for (let i = Math.floor(fx / fs) - 1; i <= Math.floor((fx + W) / fs) + 1; i++) { const w = 220 + hash(i, 4) * 160, h = 120 + hash(i, 5) * 140; roundHill(i * fs + hash(i, 6) * 120 - fx, base, w, Math.max(h, w / 2 + 10), '#8fdc7a', '#5cb85c'); }
+  // near hills + bushes
+  const nx = game.camX * 0.5, ns = 300;
+  for (let i = Math.floor(nx / ns) - 1; i <= Math.floor((nx + W) / ns) + 1; i++) {
+    const w = 120 + hash(i, 7) * 120, h = 70 + hash(i, 8) * 80;
+    roundHill(i * ns + hash(i, 9) * 100 - nx, base, w, Math.max(h, w / 2 + 6), '#4fbf4f', '#2e8b3a');
+    if (hash(i, 10) > 0.4) { const bx = i * ns + hash(i, 11) * 200 - nx; for (let k = 0; k < 3; k++) { ctx.fillStyle = k === 1 ? '#2e8b3a' : '#3aa845'; ctx.beginPath(); ctx.arc(bx + k * 18, base - 10, 16 + (k === 1 ? 6 : 0), 0, Math.PI * 2); ctx.fill(); } }
+  }
+  // ground strip far below the platforms, then the pit: falling past it is fatal
+  ctx.fillStyle = '#c8a24a'; ctx.fillRect(0, base, W, 8);
+  ctx.fillStyle = '#8a5a2b'; ctx.fillRect(0, base + 8, W, H - base - 8);
+  const pit = ctx.createLinearGradient(0, base, 0, H); pit.addColorStop(0, 'rgba(10,6,20,0)'); pit.addColorStop(1, 'rgba(10,6,20,0.9)');
+  ctx.fillStyle = pit; ctx.fillRect(0, base, W, H - base);
+}
+
+// ---------------------------------------------------------------------------
+// Sprite: an original 12x16 pixel-art plumber (red cap, blue overalls,
+// moustache). Frames are pre-rendered once to tiny canvases and drawn scaled
+// with smoothing off so the pixels stay crisp. Facing right by default.
+// ---------------------------------------------------------------------------
+const SPRITE_PAL = { R: '#e5342b', S: '#f6c8a0', B: '#5a3218', O: '#2c5fd8', Y: '#ffd166', K: '#1b1b1b', W: '#ffffff' };
+const SPRITE_FRAMES = {
+  run1: [
+    '....RRRRRR..',
+    '...RRRRRRRRR',
+    '...BBBSSKS..',
+    '..BSBSSSKSSS',
+    '..BSBBSSSKSS',
+    '..BBSSSSBBBB',
+    '....SSSSSSS.',
+    '...RROOORR..',
+    '..RRROOOORRR',
+    '.RRRROYOORRR',
+    '.SSROOOOOOSS',
+    '.SSOOOOOOOSS',
+    '..OOOOOOOOO.',
+    '..OOO...OOO.',
+    '.BBBB...BBBB',
+    'BBBBB...BBBB',
+  ],
+  run2: [
+    '....RRRRRR..',
+    '...RRRRRRRRR',
+    '...BBBSSKS..',
+    '..BSBSSSKSSS',
+    '..BSBBSSSKSS',
+    '..BBSSSSBBBB',
+    '....SSSSSSS.',
+    '...RROOORR..',
+    '..RRROOOORRR',
+    '.RRRROYOORRR',
+    '.SSROOOOOOSS',
+    '.SSOOOOOOOSS',
+    '..OOOOOOOOO.',
+    '....OOOOO...',
+    '...BBBBBBB..',
+    '..BBBB.BBBB.',
+  ],
+  jump: [
+    '....RRRRRR..',
+    '...RRRRRRRRR',
+    '...BBBSSKS..',
+    '..BSBSSSKSSS',
+    '..BSBBSSSKSS',
+    '..BBSSSSBBBB',
+    '....SSSSSSS.',
+    'SS.RROOORR.S',
+    'SSRRROOOORRS',
+    '.RRRROYOORRR',
+    '..RROOOOOORR',
+    '...OOOOOOOO.',
+    '..OOOOOOOOO.',
+    '..OOOOO.OOO.',
+    '.BBBB...BBBB',
+    '.BBBB.......',
+  ],
+};
+const SPRITE_W = 12, SPRITE_H = 16, SPRITE_SCALE = 2.5;
+const sprites = {};
+for (const [name, rows] of Object.entries(SPRITE_FRAMES)) {
+  const c = document.createElement('canvas'); c.width = SPRITE_W; c.height = SPRITE_H;
+  const g = c.getContext('2d');
+  rows.forEach((row, y) => [...row].forEach((ch, x) => { if (SPRITE_PAL[ch]) { g.fillStyle = SPRITE_PAL[ch]; g.fillRect(x, y, 1, 1); } }));
+  sprites[name] = c;
+}
+function drawPlayer(pl) {
+  const frame = !pl.onGround ? 'jump' : Math.abs(pl.vx) < 20 ? 'run1' : (Math.floor(pl.x / 16) % 2 ? 'run2' : 'run1');
+  const dw = SPRITE_W * SPRITE_SCALE, dh = SPRITE_H * SPRITE_SCALE;
+  const dx = pl.x + PW / 2 - dw / 2, dy = pl.y + PH - dh;
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  if (pl.facing < 0) { ctx.translate(dx + dw, dy); ctx.scale(-1, 1); ctx.drawImage(sprites[frame], 0, 0, dw, dh); }
+  else ctx.drawImage(sprites[frame], dx, dy, dw, dh);
+  ctx.restore();
+}
+const ZONE = { up: 'rgba(92,255,157,0.85)', mid: 'rgba(255,209,102,0.85)', down: 'rgba(255,92,122,0.9)', deep: 'rgba(78,230,255,0.55)' };
+let showHints = true;
+
+// Zones are drawn where the PLAYER'S CENTER should be, so the foot marker on
+// the character is what you line up.
+//  top band  = jump-off zones (right end):  green = well timed / edge, amber = early, red = very early
+//  body      = landing zones (from left):   red = barely made it, amber = front half, green = center, cyan = deep
+function drawZones(p, x) {
+  const y = p.y, w = p.w, right = x + w;
+  const seg = (x0, x1, color, yy, hh) => { x0 = Math.max(x, x0); x1 = Math.min(right, x1); if (x1 > x0) { ctx.fillStyle = color; ctx.fillRect(x0, yy, x1 - x0, hh); } };
+  // landing zones on the body
+  seg(x, x + w * LAND_ZONES.barely, ZONE.down, y + 5, p.h - 5);
+  seg(x + w * LAND_ZONES.barely, x + w * LAND_ZONES.front, ZONE.mid, y + 5, p.h - 5);
+  seg(x + w * LAND_ZONES.front, x + w * LAND_ZONES.center, ZONE.up, y + 5, p.h - 5);
+  seg(x + w * LAND_ZONES.center, right, ZONE.deep, y + 5, p.h - 5);
+  // jump-off zones on the top band, shifted from right-edge offset to player center
+  const c = right - PW / 2;
+  seg(x, c - JUMP_ZONES.early, ZONE.down, y, 5);
+  seg(c - JUMP_ZONES.early, c - JUMP_ZONES.good, ZONE.mid, y, 5);
+  seg(c - JUMP_ZONES.good, right, ZONE.up, y, 5);
+}
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  drawBackground();
+  ctx.save(); ctx.translate(-Math.round(game.camX), 0);
+
+  // platforms
+  for (const p of game.platforms) {
+    const x = platX(p);
+    if (x + p.w < game.camX - 50 || x > game.camX + W + 50) continue;
+    const c = COLORS[p.source];
+    ctx.shadowColor = c; ctx.shadowBlur = p.source === 'jev' ? 14 : 4;
+    ctx.fillStyle = c; ctx.fillRect(x, p.y, p.w, p.h);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(x, p.y + 4, p.w, p.h - 4);
+    if (showHints) drawZones(p, x);
+    ctx.strokeStyle = 'rgba(20,30,50,0.8)'; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, p.y + 0.5, p.w - 1, p.h - 1);
+    ctx.fillStyle = '#0b0f1a'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+    if (p.w >= 44) ctx.fillText(`${p.idx} ${KIND_LABEL[p.kind]}${p.modifier ? '+' : ''}`, x + p.w / 2, p.y + 13);
+  }
+
+  // wall
+  const wg = ctx.createLinearGradient(game.wallX - 200, 0, game.wallX, 0);
+  wg.addColorStop(0, 'rgba(255,60,90,0.0)'); wg.addColorStop(1, 'rgba(255,60,90,0.85)');
+  ctx.fillStyle = wg; ctx.fillRect(game.wallX - 200, 0, 200, H);
+  ctx.fillStyle = '#ff3c5a'; ctx.fillRect(game.wallX, 0, 3, H);
+
+  // player (pixel-art plumber; hitbox stays PW x PH, sprite is drawn 30x40 centred on it)
+  const pl = game.player;
+  drawPlayer(pl);
+  if (showHints) { ctx.fillStyle = '#ffd166'; ctx.fillRect(pl.x + PW / 2 - 1, pl.y + PH - 6, 2, 8); }
+  ctx.restore();
+
+  // HUD (translucent bar so light text stays readable over the sky)
+  ctx.fillStyle = 'rgba(10,14,30,0.55)'; ctx.fillRect(0, 0, W, 32);
+  ctx.fillStyle = '#e6ebf5'; ctx.font = '14px monospace'; ctx.textAlign = 'left';
+  ctx.fillText(`♥ ${game.lives}   cleared ${game.cleared}   streak ${game.streak}   difficulty ${diffLabel(game.difficulty)} (${game.difficulty.toFixed(2)})`, 12, 22);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = jev.online === false ? '#ff5c7a' : '#4ee6ff';
+  ctx.fillText(jev.online === false ? 'JEV OFFLINE (heuristic)' : jev.busy ? `JEV thinking… ${Math.round(performance.now() - (game.inflight?.t0 ?? performance.now()))}ms` : jev.last ? `JEV ${jev.last.latency}ms` : 'JEV', W - 12, 22);
+  if (game.flash > 0) { ctx.fillStyle = `rgba(255,60,90,${game.flash * 0.35})`; ctx.fillRect(0, 0, W, H); }
+  if (game.msgT > 0 || game.over) {
+    ctx.font = 'bold 32px monospace'; ctx.textAlign = 'center'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(10,14,30,0.8)'; ctx.lineJoin = 'round';
+    ctx.strokeText(game.msg, W / 2, H / 2 - 20); ctx.fillStyle = '#fff'; ctx.fillText(game.msg, W / 2, H / 2 - 20);
+    if (game.over) {
+      ctx.font = '14px monospace'; ctx.lineWidth = 4;
+      ctx.strokeText(`cleared ${game.cleared} · falls ${game.falls} · final difficulty ${game.difficulty.toFixed(2)} · Jev calls ${jev.count} (avg ${avgLat()}ms)`, W / 2, H / 2 + 14);
+      ctx.fillText(`cleared ${game.cleared} · falls ${game.falls} · final difficulty ${game.difficulty.toFixed(2)} · Jev calls ${jev.count} (avg ${avgLat()}ms)`, W / 2, H / 2 + 14);
+    }
+  }
+  if (!game.started) drawTitle();
+  if (game.started && game.t < 4 && !game.over) {
+    ctx.fillStyle = 'rgba(10,14,30,0.55)'; ctx.fillRect(0, H - 34, W, 34);
+    ctx.fillStyle = 'rgba(230,235,245,0.9)'; ctx.font = '13px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('→ で走って Space でジャンプ。着地するたびに Jev が次の足場を決めるわ。', W / 2, H - 20);
+  }
+}
+
+// ============================================================================
+// UI
+// ============================================================================
+const $ = id => document.getElementById(id);
+function escapeHtml(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+function avgLat() { return jev.lats.length ? Math.round(jev.lats.reduce((a, b) => a + b, 0) / jev.lats.length) : 0; }
+function log(html) { const el = $('log'); const d = document.createElement('div'); d.innerHTML = html; el.prepend(d); while (el.children.length > 40) el.lastChild.remove(); }
+function fmtAnswers(a) {
+  if (!a) return '';
+  return `skill ${a.skill.score.toFixed(2)} · p=${a.next_platform.probabilities[a.next_platform.choice].toFixed(2)} · fr ${a.frustrated.noul.toFixed(2)} · cr ${a.cruising.noul.toFixed(2)}`;
+}
+function bars(container, entries, selected, color) {
+  const el = $(container); el.innerHTML = '';
+  for (const [k, v, label] of entries) {
+    const l = document.createElement('div'); l.className = 'lbl' + (k === selected ? ' sel' : ''); l.innerHTML = `<span>${escapeHtml(label ?? k)}</span><span>${(v * 100).toFixed(0)}%</span>`;
+    const b = document.createElement('div'); b.className = 'bar'; b.innerHTML = `<i style="width:${v * 100}%;background:${color}"></i>`;
+    el.append(l, b);
+  }
+}
+function updateDiffUI() { $('diffv').textContent = `${game.difficulty.toFixed(2)} ${diffLabel(game.difficulty)}`; $('diffbar').style.width = `${game.difficulty * 100}%`; }
+function updateStatusUI() {
+  const dot = $('dot');
+  dot.className = 'dot ' + (jev.busy ? 'busy' : jev.online === false ? 'off' : jev.online ? 'on' : '');
+  $('status').textContent = jev.busy ? 'thinking…' : jev.online === false ? 'offline (heuristic)' : jev.online ? 'online' : 'idle';
+  $('model').textContent = jev.model || '';
+}
+function updateTelemetryUI() {
+  updateStatusUI(); updateDiffUI();
+  if (jev.last) {
+    $('lat').textContent = jev.last.latency;
+    $('latstats').textContent = `${avgLat()} / ${Math.min(...jev.lats)} / ${Math.max(...jev.lats)} ms (server-side ${jev.last.serverMs}ms)`;
+  }
+  $('counts').textContent = `${jev.count} / ${jev.fallbacks}`;
+  const a = jev.lastAnswers; if (!a) return;
+  $('skillv').textContent = `${a.skill.score.toFixed(2)} / 4  conf ${a.skill.confidence.toFixed(2)}`;
+  bars('skillbars', Object.entries(a.skill.probabilities).map(([k, v]) => [k, v, `${k} ${SKILL_LEGEND[+k] ?? ''}`]), null, 'var(--jev)');
+  $('choicev').textContent = `${a.next_platform.choice}  conf ${a.next_platform.confidence.toFixed(2)}`;
+  bars('choicebars', Object.entries(a.next_platform.probabilities).sort((x, y) => y[1] - x[1]).map(([k, v]) => [k, v]), a.next_platform.choice, 'var(--jev)');
+  $('frv').textContent = a.frustrated.noul.toFixed(2); $('frbar').style.width = `${a.frustrated.noul * 100}%`;
+  $('crv').textContent = a.cruising.noul.toFixed(2); $('crbar').style.width = `${a.cruising.noul * 100}%`;
+}
+
+// ============================================================================
+// Boot
+// ============================================================================
+window.addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  keys[e.code] = true;
+  if (e.code === 'KeyR') { reset(); log('— restart —'); }
+  if (e.code === 'Enter') { if (game.over) { reset(); log('— restart —'); } game.started = true; }
+  if (e.code === 'KeyH') showHints = !showHints;
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+canvas.addEventListener('pointerdown', () => { canvas.focus(); keys.Space = true; setTimeout(() => keys.Space = false, 120); });
+
+fetch('/api/health').then(r => r.json()).then(h => {
+  jev.online = h.hasKey ? null : false; jev.model = h.model;
+  if (!h.hasKey) log('<span class="x">TYPESAFE_API_KEY not set on the server — heuristic mode</span>');
+  updateStatusUI();
+}).catch(() => { jev.online = false; updateStatusUI(); });
+
+reset();
+let lastT = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - lastT) / 1000); lastT = now;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
